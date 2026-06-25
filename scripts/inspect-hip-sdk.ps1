@@ -72,6 +72,110 @@ function Record-Failure {
   $failures.Add("${Name}: $($Exception.Message)")
 }
 
+function Get-OptionalPropertyValue {
+  param(
+    [Parameter(Mandatory = $true)]
+    [object]$InputObject,
+    [Parameter(Mandatory = $true)]
+    [string]$PropertyName
+  )
+
+  $property = $InputObject.PSObject.Properties[$PropertyName]
+  if ($null -eq $property) {
+    return $null
+  }
+
+  return $property.Value
+}
+
+function Get-WebResponseUriString {
+  param(
+    [Parameter(Mandatory = $true)]
+    [object]$Response
+  )
+
+  if ($null -ne $Response.BaseResponse) {
+    $baseResponseUri = Get-OptionalPropertyValue -InputObject $Response.BaseResponse -PropertyName 'ResponseUri'
+    if ($baseResponseUri) {
+      return [string]$baseResponseUri
+    }
+
+    $requestMessage = Get-OptionalPropertyValue -InputObject $Response.BaseResponse -PropertyName 'RequestMessage'
+    if ($requestMessage) {
+      $requestUri = Get-OptionalPropertyValue -InputObject $requestMessage -PropertyName 'RequestUri'
+      if ($requestUri) {
+        return [string]$requestUri
+      }
+    }
+  }
+
+  return $null
+}
+
+function Save-ResponseHeaders {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+    [Parameter(Mandatory = $true)]
+    [object]$Response
+  )
+
+  $headers = @()
+  foreach ($headerName in $Response.Headers.Keys) {
+    $headers += "${headerName}: $($Response.Headers[$headerName])"
+  }
+  Save-Lines -Path $Path -Lines $headers
+}
+
+function Save-TextPreview {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$InputPath,
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath
+  )
+
+  try {
+    $previewLines = Get-Content -Path $InputPath -TotalCount 120 -ErrorAction Stop
+    if ($previewLines) {
+      Save-Lines -Path $OutputPath -Lines $previewLines
+    }
+  }
+  catch {
+    Record-Failure -Name "preview:$InputPath" -Exception $_.Exception
+  }
+}
+
+function Get-LicenseFormBody {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Html,
+    [Parameter(Mandatory = $true)]
+    [string]$Filename
+  )
+
+  $body = @{}
+  $inputMatches = [System.Text.RegularExpressions.Regex]::Matches(
+    $Html,
+    '<input[^>]+type="hidden"[^>]+name="(?<name>[^"]+)"[^>]+value="(?<value>[^"]*)"',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+  )
+
+  foreach ($match in $inputMatches) {
+    $name = $match.Groups['name'].Value
+    $value = $match.Groups['value'].Value
+    if ($name) {
+      $body[$name] = $value
+    }
+  }
+
+  if (-not $body.ContainsKey('filename')) {
+    $body['filename'] = $Filename
+  }
+
+  return $body
+}
+
 function Invoke-Section {
   param(
     [Parameter(Mandatory = $true)]
@@ -97,8 +201,21 @@ function Get-UninstallEntries {
 
   foreach ($registryPath in $registryPaths) {
     Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue |
-      Where-Object { -not [string]::IsNullOrWhiteSpace($_.DisplayName) } |
-      Select-Object DisplayName, DisplayVersion, Publisher, InstallDate, InstallLocation, PSPath
+      Where-Object {
+        $displayName = Get-OptionalPropertyValue -InputObject $_ -PropertyName 'DisplayName'
+        -not [string]::IsNullOrWhiteSpace($displayName)
+      } |
+      Select-Object @{
+        Name = 'DisplayName'; Expression = { Get-OptionalPropertyValue -InputObject $_ -PropertyName 'DisplayName' }
+      }, @{
+        Name = 'DisplayVersion'; Expression = { Get-OptionalPropertyValue -InputObject $_ -PropertyName 'DisplayVersion' }
+      }, @{
+        Name = 'Publisher'; Expression = { Get-OptionalPropertyValue -InputObject $_ -PropertyName 'Publisher' }
+      }, @{
+        Name = 'InstallDate'; Expression = { Get-OptionalPropertyValue -InputObject $_ -PropertyName 'InstallDate' }
+      }, @{
+        Name = 'InstallLocation'; Expression = { Get-OptionalPropertyValue -InputObject $_ -PropertyName 'InstallLocation' }
+      }, PSPath
   }
 }
 
@@ -202,28 +319,29 @@ Invoke-Section -Name 'system-metadata' -Script {
 Invoke-Section -Name 'download-installer' -Script {
   $attempts = @()
 
-  foreach ($index in 0..($installerUrls.Count - 1)) {
+  for ($index = 0; $index -lt $installerUrls.Count; $index++) {
     $url = $installerUrls[$index]
     $attemptId = $index + 1
     $downloadPath = Join-Path $downloadsDir ("attempt-${attemptId}.bin")
 
     try {
-      $response = Invoke-WebRequest -Uri $url -MaximumRedirection 10 -OutFile $downloadPath -PassThru
-      $headers = foreach ($headerName in $response.Headers.Keys) {
-        "${headerName}: $($response.Headers[$headerName])"
-      }
-      Save-Lines -Path (Join-Path $downloadsDir ("attempt-${attemptId}-headers.txt")) -Lines $headers
+      $webSession = $null
+      $response = Invoke-WebRequest -Uri $url -MaximumRedirection 10 -OutFile $downloadPath -PassThru -SessionVariable webSession
+      Save-ResponseHeaders -Path (Join-Path $downloadsDir ("attempt-${attemptId}-headers.txt")) -Response $response
 
       $isPortableExecutable = Test-PortableExecutable -Path $downloadPath
       $fileInfo = Get-Item $downloadPath
+      $contentType = $response.Headers['Content-Type']
+      $finalUri = Get-WebResponseUriString -Response $response
 
       $attempts += [pscustomobject]@{
         url = $url
         path = $downloadPath
         length = $fileInfo.Length
-        finalUri = [string]$response.BaseResponse.ResponseUri
-        contentType = $response.Headers['Content-Type']
+        finalUri = $finalUri
+        contentType = $contentType
         isPortableExecutable = $isPortableExecutable
+        phase = 'initial'
       }
 
       if ($isPortableExecutable) {
@@ -233,9 +351,40 @@ Invoke-Section -Name 'download-installer' -Script {
         break
       }
 
-      $previewLines = Get-Content -Path $downloadPath -TotalCount 80 -ErrorAction SilentlyContinue
-      if ($previewLines) {
-        Save-Lines -Path (Join-Path $downloadsDir ("attempt-${attemptId}-preview.txt")) -Lines $previewLines
+      Save-TextPreview -InputPath $downloadPath -OutputPath (Join-Path $downloadsDir ("attempt-${attemptId}-preview.txt"))
+
+      if ($contentType -like 'text/html*') {
+        $html = Get-Content -Path $downloadPath -Raw -ErrorAction Stop
+        $filenameMatch = [System.Text.RegularExpressions.Regex]::Match($html, '<input[^>]+name="filename"[^>]+value="(?<filename>[^"]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        $filename = if ($filenameMatch.Success) { $filenameMatch.Groups['filename'].Value } else { [System.IO.Path]::GetFileName(($url -split 'filename=')[-1]) }
+        $postBody = Get-LicenseFormBody -Html $html -Filename $filename
+        $postPath = Join-Path $downloadsDir ("attempt-${attemptId}-accepted.bin")
+        $postResponse = Invoke-WebRequest -Uri $url -Method Post -Body $postBody -WebSession $webSession -MaximumRedirection 10 -OutFile $postPath -PassThru
+        Save-ResponseHeaders -Path (Join-Path $downloadsDir ("attempt-${attemptId}-accepted-headers.txt")) -Response $postResponse
+
+        $postFileInfo = Get-Item $postPath
+        $postIsPortableExecutable = Test-PortableExecutable -Path $postPath
+        $postContentType = $postResponse.Headers['Content-Type']
+        $postFinalUri = Get-WebResponseUriString -Response $postResponse
+
+        $attempts += [pscustomobject]@{
+          url = $url
+          path = $postPath
+          length = $postFileInfo.Length
+          finalUri = $postFinalUri
+          contentType = $postContentType
+          isPortableExecutable = $postIsPortableExecutable
+          phase = 'accept-post'
+        }
+
+        if ($postIsPortableExecutable) {
+          $installerPath = Join-Path $downloadsDir 'hip-sdk-installer.exe'
+          Move-Item -Path $postPath -Destination $installerPath -Force
+          $selectedInstallerUrl = $url
+          break
+        }
+
+        Save-TextPreview -InputPath $postPath -OutputPath (Join-Path $downloadsDir ("attempt-${attemptId}-accepted-preview.txt"))
       }
     }
     catch {
@@ -277,7 +426,8 @@ Invoke-Section -Name 'post-install-metadata' -Script {
 
   $uninstallEntries = @(Get-UninstallEntries)
   $amdEntries = $uninstallEntries | Where-Object {
-    $_.DisplayName -match 'AMD|HIP|ROCm|Radeon' -or $_.Publisher -match 'AMD'
+    ((Get-OptionalPropertyValue -InputObject $_ -PropertyName 'DisplayName') -match 'AMD|HIP|ROCm|Radeon') -or
+    ((Get-OptionalPropertyValue -InputObject $_ -PropertyName 'Publisher') -match 'AMD')
   }
   Save-Json -Path (Join-Path $metadataDir 'uninstall-entries-amd.json') -Value $amdEntries
 
