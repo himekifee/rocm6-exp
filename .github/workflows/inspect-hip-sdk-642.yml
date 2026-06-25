@@ -1,0 +1,39 @@
+name: inspect-hip-sdk-6-4-2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/inspect-hip-sdk-642.yml"
+      - "scripts/inspect-hip-sdk.ps1"
+      - "README.md"
+
+jobs:
+  inspect:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run HIP SDK inspection
+        shell: pwsh
+        continue-on-error: true
+        env:
+          HIP_SDK_INSTALLER_URLS: >-
+            https://www.amd.com/en/developer/resources/rocm-hub/eula/licenses.html?filename=AMD-Software-PRO-Edition-25.Q3-WinSvr2022-For-HIP.exe;
+            https://www.amd.com/en/developer/resources/rocm-hub/eula/licenses.html?filename=AMD-Software-PRO-Edition-25.Q3-Win10-Win11-For-HIP.exe
+        run: ./scripts/inspect-hip-sdk.ps1
+
+      - name: Upload inspection artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hip-sdk-6-4-2-inspection-${{ github.run_id }}
+          path: artifacts
+          if-no-files-found: error
